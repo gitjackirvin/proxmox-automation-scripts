@@ -1,0 +1,19 @@
+#!/bin/bash
+
+echo "=== Removing pools based ONLY on parsed names ==="
+
+# Get raw pool list exactly as Proxmox prints it
+RAW=$(pvesh ls /pools 2>/dev/null)
+
+# Extract ONLY the last column (the actual pool name)
+POOLS=$(echo "$RAW" | awk 'NR>1 {print $NF}')
+
+for pool in $POOLS; do
+    echo "Attempting to delete pool: $pool"
+
+    pvesh delete /pools/$pool >/dev/null 2>&1 \
+        && echo "✓ Deleted $pool" \
+        || echo "✗ Failed to delete $pool"
+done
+
+echo "=== Pool cleanup complete ==="
