@@ -1,0 +1,178 @@
+#!/bin/bash
+
+INPUT="students.tsv"
+REALM="AD-Server-Courses"
+
+###############################################
+# MODE SELECTION (SAFE)
+###############################################
+echo "Select mode:"
+echo "1) Create users/pools/groups (TSV only)"
+echo "2) Delete users/pools/groups (TSV only)"
+read -p "Enter choice: " mode
+
+case $mode in
+    1) ACTION="create" ;;
+    2) ACTION="delete" ;;
+    *) echo "Invalid choice"; exit 1 ;;
+esac
+
+echo ""
+echo "Mode selected: $ACTION"
+echo ""
+
+###############################################
+# PREFIX SELECTION
+###############################################
+echo "Select prefix:"
+echo "1) FA"
+echo "2) SM"
+echo "3) SP"
+read -p "Enter choice: " choice
+
+case $choice in
+    1) prefix="FA" ;;
+    2) prefix="SM" ;;
+    3) prefix="SP" ;;
+    *) echo "Invalid choice"; exit 1 ;;
+esac
+
+echo ""
+echo "Using prefix: $prefix"
+echo ""
+
+###############################################
+# CLASS PREFIX DISCOVERY
+###############################################
+echo "Scanning class prefixes..."
+
+prefixes=$(awk '
+    NR>1 {
+        sec=$6
+        if (sec ~ /^(CIS|TEC)-[0-9]+-/) {
+            split(sec, a, "-")
+            print a[1] "-" a[2]
+        }
+    }
+' "$INPUT" | sort -u)
+
+echo ""
+echo "Available class prefixes:"
+i=1
+declare -A prefixmap
+for cls in $prefixes; do
+    echo "$i) $cls"
+    prefixmap[$i]=$cls
+    ((i++))
+done
+
+echo ""
+read -p "Enter class numbers separated by spaces: " class_choices
+
+selected_classes=()
+for c in $class_choices; do
+    [[ -n "${prefixmap[$c]}" ]] && selected_classes+=("${prefixmap[$c]}")
+done
+
+echo ""
+echo "Selected class prefixes:"
+printf " - %s\n" "${selected_classes[@]}"
+echo ""
+
+###############################################
+# MAIN LOOP — TSV ONLY
+###############################################
+tail -n +2 "$INPUT" | while read -r student_id first last term programs sec_name email
+do
+    [[ "$sec_name" =~ ^(CIS|TEC)-[0-9]+- ]] || continue
+
+    class_prefix=$(echo "$sec_name" | awk -F'-' '{print $1"-"$2}')
+
+    match=false
+    for cls in "${selected_classes[@]}"; do
+        if [[ "$class_prefix" == "$cls" ]]; then
+            match=true
+            group="${class_prefix}-AD-Server-Courses"
+        fi
+    done
+
+    $match || continue
+
+    userid="${prefix}-${student_id}@${REALM}"
+    pool="$(echo "${first:0:1}${last}" | tr '[:upper:]' '[:lower:]')"
+
+    echo ""
+    echo "=== Processing $first $last ($student_id) ==="
+    echo "UserID: $userid"
+    echo "Pool: $pool"
+    echo "Group: $group"
+    echo ""
+
+    ############################################################
+    # DELETE MODE — TSV ONLY
+    ############################################################
+    if [[ "$ACTION" == "delete" ]]; then
+
+        # Remove user from group (safe)
+        pveum usermod "$userid" -group "" >/dev/null 2>&1 \
+            && echo "✓ Removed from group"
+
+        # Delete user (safe)
+        pvesh delete /access/users/$userid >/dev/null 2>&1 \
+            && echo "✓ User deleted"
+
+        # Delete pool (safe)
+        pvesh delete /pools/$pool >/dev/null 2>&1 \
+            && echo "✓ Pool deleted"
+
+        continue
+    fi
+
+    ############################################################
+    # CREATE MODE — TSV ONLY + COMPLIANCE
+    ############################################################
+
+    ############################
+    # USER COMPLIANCE
+    ############################
+    if pvesh get /access/users/$userid >/dev/null 2>&1; then
+        echo "✓ User exists — compliance OK"
+    else
+        pvesh create /access/users \
+            -userid "$userid" \
+            -firstname "$first" \
+            -lastname "$last" \
+            -email "$email" \
+            -enable 1 >/dev/null 2>&1 \
+            && echo "✓ User created"
+    fi
+
+    ############################
+    # POOL COMPLIANCE
+    ############################
+    if pvesh get /pools/$pool >/dev/null 2>&1; then
+        echo "✓ Pool exists — compliance OK"
+    else
+        pvesh create /pools -poolid "$pool" >/dev/null 2>&1 \
+            && echo "✓ Pool created"
+    fi
+
+    ############################
+    # ACL COMPLIANCE
+    ############################
+    pvesh set /access/acl \
+        -path "/pool/$pool" \
+        -roles "General-User" \
+        -users "$userid" >/dev/null 2>&1 \
+        && echo "✓ ACL compliance OK"
+
+    ############################
+    # GROUP COMPLIANCE
+    ############################
+    pveum usermod "$userid" -group "$group" >/dev/null 2>&1 \
+        && echo "✓ Group membership OK"
+
+done
+
+echo ""
+echo "=== ALL OPERATIONS COMPLETE — TSV ONLY ==="
