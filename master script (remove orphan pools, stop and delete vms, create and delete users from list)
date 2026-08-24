@@ -1,0 +1,131 @@
+#!/bin/bash
+
+INPUT="students.tsv"
+REALM="AD-Server-Courses"
+
+###############################################
+# MODE SELECTION
+###############################################
+echo "Select mode:"
+echo "1) Create users/pools/groups (TSV only)"
+echo "2) Delete users/pools/groups (TSV only)"
+echo "3) Remove orphan pools AND VMs by prefix"
+read -p "Enter choice: " mode
+
+case $mode in
+    1) ACTION="create" ;;
+    2) ACTION="delete" ;;
+    3) ACTION="cleanup" ;;
+    *) echo "Invalid choice"; exit 1 ;;
+esac
+
+echo ""
+echo "Mode selected: $ACTION"
+echo ""
+
+###############################################
+# PREFIX SELECTION FOR CREATE/DELETE
+###############################################
+prefix=""
+if [[ "$ACTION" == "create" || "$ACTION" == "delete" ]]; then
+    echo "Select prefix:"
+    echo "1) FA"
+    echo "2) SM"
+    echo "3) SP"
+    read -p "Enter choice: " choice
+
+    case $choice in
+        1) prefix="FA" ;;
+        2) prefix="SM" ;;
+        3) prefix="SP" ;;
+        *) echo "Invalid choice"; exit 1 ;;
+    esac
+
+    echo ""
+    echo "Using prefix: $prefix"
+    echo ""
+fi
+
+###############################################
+# MODE 3 — CLEANUP: ORPHAN POOLS + VMs
+###############################################
+if [[ "$ACTION" == "cleanup" ]]; then
+    ###############################################
+    # PREFIX MULTI-SELECTION
+    ###############################################
+    echo "Select prefixes to CLEAN (you may choose multiple):"
+    echo "1) FA"
+    echo "2) SM"
+    echo "3) SP"
+    read -p "Enter choices separated by spaces: " choices
+
+    selected_prefixes=()
+    for c in $choices; do
+        case $c in
+            1) selected_prefixes+=("FA") ;;
+            2) selected_prefixes+=("SM") ;;
+            3) selected_prefixes+=("SP") ;;
+            *) echo "Invalid prefix choice: $c"; exit 1 ;;
+        esac
+    done
+
+    if [[ ${#selected_prefixes[@]} -eq 0 ]]; then
+        echo "No prefixes selected. Exiting."
+        exit 1
+    fi
+
+    echo ""
+    echo "Prefixes selected for cleanup:"
+    printf " - %s\n" "${selected_prefixes[@]}"
+    echo ""
+
+    ###############################################
+    # SHOW ALL POOLS
+    ###############################################
+    echo "=== ALL POOLS ==="
+    RAW=$(pvesh ls /pools 2>/dev/null)
+    POOLS=$(echo "$RAW" | awk 'NR>1 {print $NF}')
+    printf "%s\n" ${POOLS}
+    echo ""
+    read -p "Type DELETE to remove orphan pools: " confirm_pools
+    [[ "$confirm_pools" == "DELETE" ]] || { echo "Pool deletion cancelled."; echo ""; }
+
+    ###############################################
+    # REMOVE ORPHAN POOLS
+    ###############################################
+    if [[ "$confirm_pools" == "DELETE" ]]; then
+        echo "=== Removing orphan pools ==="
+        for pool in $POOLS; do
+            VMCOUNT=$(pvesh get /pools/$pool 2>/dev/null | awk '/vmid/ {count++} END {print count+0}')
+            USERCOUNT=$(pvesh get /access/acl -path "/pool/$pool" 2>/dev/null | awk '/users/ {count++} END {print count+0}')
+
+            if [[ "$VMCOUNT" -eq 0 && "$USERCOUNT" -eq 0 ]]; then
+                echo "Deleting orphan pool: $pool"
+                pvesh delete /pools/$pool >/dev/null 2>&1 && echo "✓ Deleted $pool"
+            fi
+        done
+        echo "=== Orphan pool cleanup complete ==="
+        echo ""
+    fi
+
+    ###############################################
+    # FIND USERS WITH RUNNING VMs (BY PREFIX)
+    ###############################################
+    echo "=== USERS WITH VMs (selected prefixes, 7-digit IDs only) ==="
+
+    ALL_USERS=$(pvesh ls /access/users 2>/dev/null | awk 'NR>1 {print $1}')
+    users_to_clean=()
+
+    for user in $ALL_USERS; do
+        base=$(echo "$user" | cut -d'@' -f1)
+        pre=$(echo "$base" | cut -d'-' -f1)
+        id=$(echo "$base" | cut -d'-' -f2)
+
+        # Safety rule: must be exactly PREFIX-1234567 (7 digits)
+        if [[ ! "$id" =~ ^[0-9]{7}$ ]]; then
+            continue
+        fi
+
+        # Only prefixes selected
+        match_prefix=false
+        for p in
