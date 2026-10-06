@@ -1,0 +1,125 @@
+cat << 'EOF' > proxmox_user_cleaner.sh && chmod +x proxmox_user_cleaner.sh && ./proxmox_user_cleaner.sh
+#!/bin/bash
+
+VANISHED_USERS_FILE=$(mktemp)
+
+cleanup() {
+    rm -f "$VANISHED_USERS_FILE"
+}
+trap cleanup EXIT
+
+run_audit() {
+    > "$VANISHED_USERS_FILE"
+
+    # 1. Gather all existing valid user accounts
+    mapfile -t VALID_USERS < <(pveum user list --output-format json | grep -oP '"userid":"\K[^" ]+')
+
+    contains_element() {
+        local e match="$1"
+        shift
+        for e; do [[ "$e" == "$match" ]] && return 0; done
+        return 1
+    }
+
+    # 2. Parse user.cfg specifically for individual users
+    if [ -f /etc/pve/user.cfg ]; then
+        while read -r line; do
+            if [[ "$line" =~ ^acl: ]]; then
+                # The 4th field contains comma-separated actors
+                local actors=$(echo "$line" | cut -d':' -f4)
+                IFS=',' read -ra actor_arr <<< "$actors"
+                for actor in "${actor_arr[@]}"; do
+                    # STRICT REGEX MATCH FOR USER:
+                    # Must contain '@' but CANNOT start with '@' (which denotes a group)
+                    if [[ "$actor" =~ ^[^@]+@[^@]+$ ]]; then
+                        if ! contains_element "$actor" "${VALID_USERS[@]}"; then
+                            if ! grep -q "^$actor$" "$VANISHED_USERS_FILE"; then
+                                echo "$actor" >> "$VANISHED_USERS_FILE"
+                            fi
+                        fi
+                    fi
+                done
+            fi
+        done < /etc/pve/user.cfg
+    fi
+}
+
+show_menu() {
+    while true; do
+        run_audit
+        
+        local count=0
+        if [ -s "$VANISHED_USERS_FILE" ]; then
+            count=$(wc -l < "$VANISHED_USERS_FILE")
+        fi
+
+        echo "=========================================================="
+        echo "          INDIVIDUAL VANISHED ACL USER CLEANER            "
+        echo "=========================================================="
+        echo "Total Vanished Individual Users Found: $count"
+        echo "--------------------------------------------------------"
+        
+        if [ "$count" -gt 0 ]; then
+            local index=1
+            while read -r user; do
+                printf "%2d) %s\n" "$index" "$user"
+                ((index++))
+            done < "$VANISHED_USERS_FILE"
+        else
+            echo " No vanished individual users found!"
+        fi
+        
+        echo "--------------------------------------------------------"
+        echo "1] Leave the GUI / Exit script"
+        echo "2] Directly purge individual users from /etc/pve/user.cfg"
+        echo "3] Re-run user audit"
+        echo "--------------------------------------------------------"
+        read -p "Select an option [1-3]: " choice
+        echo ""
+
+        case "$choice" in
+            1)
+                echo "Exiting cleaner. Goodbye!"
+                exit 0
+                ;;
+            2)
+                if [ ! -s "$VANISHED_USERS_FILE" ]; then
+                    echo "No vanished individual users to fix."
+                else
+                    echo "Backing up user.cfg..."
+                    cp /etc/pve/user.cfg /etc/pve/user.cfg.bak
+                    
+                    echo "Purging legacy user names directly from ACL lines..."
+                    while read -r user; do
+                        echo "  -> Removing individual vanished user: $user"
+                        
+                        # Use sed to safely drop the exact username from commas or colons
+                        sed -i "s/,$user,/,/g" /etc/pve/user.cfg
+                        sed -i "s/:\s*$user,/:/g" /etc/pve/user.cfg
+                        sed -i "s/,$user\s*:/:/g" /etc/pve/user.cfg
+                        sed -i "s/:\s*$user\s*:/::/g" /etc/pve/user.cfg
+                    done < "$VANISHED_USERS_FILE"
+                    
+                    # Clean up empty or broken leftover ACL lines lines safely
+                    sed -i '/^acl:[0-9]:[^:]*::[^:]*:/d' /etc/pve/user.cfg
+                    
+                    echo "--------------------------------------------------------"
+                    echo "Direct configuration cleaning complete."
+                fi
+                echo ""
+                ;;
+            3)
+                echo "Re-scanning system..."
+                echo ""
+                ;;
+            *)
+                echo "Invalid option. Please choose 1, 2, or 3."
+                echo ""
+                ;;
+        esac
+    done
+}
+
+# Run program
+show_menu
+EOF
